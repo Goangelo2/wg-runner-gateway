@@ -7,10 +7,6 @@ on:
         description: "Nom de la machine sur Tailscale"
         required: false
         default: "gh-runner-gateway"
-      ts_tag:
-        description: "Tag Tailscale (ex: tag:ci)"
-        required: false
-        default: "tag:ci"
       job_duration_minutes:
         description: "Durée de maintien active en minutes (max 350)"
         required: false
@@ -34,9 +30,7 @@ jobs:
       - name: Démarrer Tailscale en Exit Node
         uses: tailscale/github-action@v3
         with:
-          oauth-client-id: "${{ secrets.TS_OAUTH_CLIENT_ID }}"
-          oauth-secret: "${{ secrets.TS_OAUTH_SECRET }}"
-          tags: "${{ github.event.inputs.ts_tag }}"
+          authkey: "${{ secrets.TS_AUTHKEY }}"
           hostname: "${{ github.event.inputs.hostname }}"
           args: "--advertise-exit-node"
 
