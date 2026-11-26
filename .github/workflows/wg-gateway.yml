@@ -1,0 +1,114 @@
+name: WireGuard Gateway
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Durée de maintien en minutes (5-350)"
+        required: true
+        default: "300"
+
+permissions:
+  contents: read
+
+jobs:
+  wg-gateway:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Installer dépendances
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools curl wget tar
+
+      - name: Installer wstunnel et bore
+        run: |
+          set -e
+          WSTUNNEL_VER="v10.1.5"
+          wget -q "https://github.com/erebe/wstunnel/releases/download/${WSTUNNEL_VER}/wstunnel_${WSTUNNEL_VER#v}_linux_amd64.tar.gz"
+          tar xzf wstunnel_*_linux_amd64.tar.gz
+          sudo mv wstunnel /usr/local/bin/
+          rm -f wstunnel_*_linux_amd64.tar.gz
+
+          BORE_VER="v0.5.3"
+          wget -q "https://github.com/ekzhang/bore/releases/download/${BORE_VER}/bore-${BORE_VER}-x86_64-unknown-linux-musl.tar.gz"
+          tar xzf bore-*.tar.gz
+          sudo mv bore /usr/local/bin/
+          rm -f bore-*.tar.gz
+
+      - name: Activer le forwarding IP
+        run: sudo sysctl -w net.ipv4.ip_forward=1
+
+      - name: Générer les clés WireGuard
+        run: |
+          umask 077
+          wg genkey > server_private.key
+          wg pubkey < server_private.key > server_public.key
+          wg genkey > client_private.key
+          wg pubkey < client_private.key > client_public.key
+          echo "SERVER_PRIVATE=$(cat server_private.key)" >> $GITHUB_ENV
+          echo "SERVER_PUBLIC=$(cat server_public.key)" >> $GITHUB_ENV
+          echo "CLIENT_PRIVATE=$(cat client_private.key)" >> $GITHUB_ENV
+          echo "CLIENT_PUBLIC=$(cat client_public.key)" >> $GITHUB_ENV
+
+      - name: Configurer et démarrer WireGuard
+        run: |
+          sudo mkdir -p /etc/wireguard
+          sudo tee /etc/wireguard/wg0.conf > /dev/null <<EOF
+          [Interface]
+          Address = 10.66.66.1/24
+          ListenPort = 51820
+          PrivateKey = ${{ env.SERVER_PRIVATE }}
+          PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+          PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+          [Peer]
+          PublicKey = ${{ env.CLIENT_PUBLIC }}
+          AllowedIPs = 10.66.66.2/32
+          EOF
+          sudo chmod 600 /etc/wireguard/wg0.conf
+          sudo wg-quick up wg0
+
+      - name: Lancer wstunnel server
+        run: |
+          nohup wstunnel server ws://0.0.0.0:8080 --restrict-to 127.0.0.1:51820 > /tmp/wstunnel.log 2>&1 &
+          sleep 2
+          cat /tmp/wstunnel.log
+
+      - name: Exposer via bore.pub
+        id: bore
+        run: |
+          nohup bore local 8080 --to bore.pub > /tmp/bore.log 2>&1 &
+          sleep 8
+          cat /tmp/bore.log
+          PORT=$(grep -oP 'bore\.pub:\K[0-9]+' /tmp/bore.log | head -1)
+          echo "public_port=${PORT}" >> $GITHUB_OUTPUT
+
+      - name: Afficher la configuration client
+        run: |
+          echo "════════════════════════════════════════════════════"
+          echo "  CONFIGURATION CLIENT"
+          echo "════════════════════════════════════════════════════"
+          echo "Endpoint public : bore.pub:${{ steps.bore.outputs.public_port }}"
+          echo ""
+          echo "--- Téléphone (Termux) : lancer wstunnel ---"
+          echo "pkg install wstunnel -y"
+          echo "wstunnel client -L \"udp://51821:127.0.0.1:51820?timeout_sec=0\" ws://bore.pub:${{ steps.bore.outputs.public_port }}"
+          echo ""
+          echo "--- Fichier WireGuard (importer dans l'app) ---"
+          echo "[Interface]"
+          echo "PrivateKey = ${{ env.CLIENT_PRIVATE }}"
+          echo "Address = 10.66.66.2/32"
+          echo "DNS = 1.1.1.1"
+          echo ""
+          echo "[Peer]"
+          echo "PublicKey = ${{ env.SERVER_PUBLIC }}"
+          echo "Endpoint = 127.0.0.1:51821"
+          echo "AllowedIPs = 0.0.0.0/0"
+          echo "PersistentKeepalive = 25"
+          echo "════════════════════════════════════════════════════"
+
+      - name: Maintenir le job actif
+        run: |
+          echo "Gateway actif pendant ${{ inputs.duration_minutes }} minutes."
+          sleep $((${{ inputs.duration_minutes }} * 60))
