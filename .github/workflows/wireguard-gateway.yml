@@ -41,7 +41,7 @@ jobs:
 
       - name: Charger le module noyau WireGuard si disponible
         run: |
-          sudo modprobe wireguard || echo "Module wireguard non chargé via modprobe (vérification de l'interface au démarrage)"
+          sudo modprobe wireguard || echo "Module wireguard non chargé via modprobe"
 
       - name: Activer le transfert IP (IPv4 & IPv6)
         run: |
@@ -58,11 +58,12 @@ jobs:
       - name: Détecter l'interface réseau et l'IP publique via STUN
         id: net
         env:
-          WG_PORT: ${{ github.event.inputs.listen_port || '51820' }}
+          WG_PORT: ${{ github.event.inputs.listen_port }}
         run: |
+          WG_PORT="${WG_PORT:-51820}"
           IFACE=$(ip -4 route ls default | awk '/default/ {print $5; exit}')
 
-          STUN_RESULT=$(python3 - <<'PY' || true
+          STUN_RESULT=$(WG_PORT="$WG_PORT" python3 - <<'PY' || true
 import os, socket, struct
 
 servers = [
@@ -72,7 +73,6 @@ servers = [
 ]
 local_port = int(os.environ.get("WG_PORT", "51820"))
 tid = os.urandom(12)
-# STUN Binding Request: type 0x0001, length 0, magic cookie 0x2112A442 + 12-byte transaction ID
 req = struct.pack("!HHI12s", 0x0001, 0, 0x2112A442, tid)
 
 for host, port in servers:
@@ -91,7 +91,7 @@ for host, port in servers:
         while idx + 4 <= 20 + msg_len and idx + 4 <= len(data):
             attr_type, attr_len = struct.unpack("!HH", data[idx:idx+4])
             val = data[idx+4:idx+4+attr_len]
-            if attr_type == 0x0020 and attr_len >= 8:  # XOR-MAPPED-ADDRESS
+            if attr_type == 0x0020 and attr_len >= 8:
                 fam = val[1]
                 if fam == 0x01:
                     xport = struct.unpack("!H", val[2:4])[0] ^ 0x2112
@@ -99,7 +99,7 @@ for host, port in servers:
                     ip_str = socket.inet_ntoa(struct.pack("!I", xip))
                     print(f"{ip_str}:{xport}")
                     break
-            elif attr_type == 0x0001 and attr_len >= 8:  # MAPPED-ADDRESS
+            elif attr_type == 0x0001 and attr_len >= 8:
                 fam = val[1]
                 if fam == 0x01:
                     mport = struct.unpack("!H", val[2:4])[0]
@@ -133,11 +133,13 @@ PY
           echo "Interface détectée : ${IFACE}"
 
       - name: Créer la configuration serveur WireGuard
+        env:
+          IFACE: ${{ steps.net.outputs.iface }}
+          LISTEN_PORT: ${{ github.event.inputs.listen_port }}
         run: |
           SERVER_PRIVATE=$(cat wg-config/server_private.key)
           CLIENT_PUBLIC=$(cat wg-config/client_public.key)
-          IFACE="${{ steps.net.outputs.iface }}"
-          PORT="${{ github.event.inputs.listen_port || '51820' }}"
+          PORT="${LISTEN_PORT:-51820}"
 
           cat > wg-config/wg0.conf <<EOF
           [Interface]
@@ -159,16 +161,15 @@ PY
           sudo wg show
 
       - name: Générer la configuration client
+        env:
+          ENDPOINT_HOST: ${{ github.event.inputs.endpoint_host }}
+          PUBLIC_IP: ${{ steps.net.outputs.public_ip }}
+          LISTEN_PORT: ${{ github.event.inputs.listen_port }}
         run: |
           CLIENT_PRIVATE=$(cat wg-config/client_private.key)
           SERVER_PUBLIC=$(cat wg-config/server_public.key)
-          RAW_HOST="${{ github.event.inputs.endpoint_host }}"
-          if [ -n "$RAW_HOST" ]; then
-            HOST="$RAW_HOST"
-          else
-            HOST="${{ steps.net.outputs.public_ip }}"
-          fi
-          PORT="${{ github.event.inputs.listen_port || '51820' }}"
+          HOST="${ENDPOINT_HOST:-$PUBLIC_IP}"
+          PORT="${LISTEN_PORT:-51820}"
 
           cat > wg-config/client.conf <<EOF
           [Interface]
@@ -193,14 +194,16 @@ PY
         env:
           CLIENT_IP: ${{ github.event.inputs.client_ip }}
           CLIENT_PORT: ${{ github.event.inputs.client_port }}
-          WG_PORT: ${{ github.event.inputs.listen_port || '51820' }}
-          MINUTES: ${{ github.event.inputs.job_duration_minutes || '300' }}
+          LISTEN_PORT: ${{ github.event.inputs.listen_port }}
+          DURATION_MIN: ${{ github.event.inputs.job_duration_minutes }}
         run: |
           if [ -z "$CLIENT_IP" ] || [ -z "$CLIENT_PORT" ]; then
             echo "client_ip ou client_port non renseigné : percement NAT UDP ignoré."
             exit 0
           fi
 
+          WG_PORT="${LISTEN_PORT:-51820}"
+          MINUTES="${DURATION_MIN:-300}"
           if [ "$MINUTES" -gt 350 ]; then
             MINUTES=350
           fi
@@ -225,8 +228,10 @@ PY
           retention-days: 1
 
       - name: Maintenir le tunnel actif
+        env:
+          DURATION_MIN: ${{ github.event.inputs.job_duration_minutes }}
         run: |
-          MINUTES="${{ github.event.inputs.job_duration_minutes || '300' }}"
+          MINUTES="${DURATION_MIN:-300}"
           if [ "$MINUTES" -gt 350 ]; then
             MINUTES=350
           fi
