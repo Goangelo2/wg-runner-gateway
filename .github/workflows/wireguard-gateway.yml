@@ -1,0 +1,121 @@
+name: WireGuard Gateway (Runner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      endpoint_host:
+        description: "IP publique ou domaine du runner (laisser vide pour 127.0.0.1)"
+        required: false
+        default: "127.0.0.1"
+      listen_port:
+        description: "Port UDP d'écoute WireGuard"
+        required: false
+        default: "51820"
+      job_duration_minutes:
+        description: "Durée de maintien du tunnel en minutes (max 350)"
+        required: false
+        default: "300"
+
+jobs:
+  wireguard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Installer WireGuard, qrencode et iptables
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y wireguard-tools qrencode iptables curl
+
+      - name: Activer le transfert IP
+        run: |
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+
+      - name: Générer les clés
+        run: |
+          mkdir -p wg-config
+          umask 077
+          wg genkey | tee wg-config/server_private.key | wg pubkey > wg-config/server_public.key
+          wg genkey | tee wg-config/client_private.key | wg pubkey > wg-config/client_public.key
+
+      - name: Détecter l'interface réseau par défaut
+        id: net
+        run: |
+          IFACE=$(ip -4 route ls default | awk '/default/ {print $5; exit}')
+          echo "iface=${IFACE}" >> "$GITHUB_OUTPUT"
+          echo "Interface détectée : ${IFACE}"
+
+      - name: Créer la configuration serveur WireGuard
+        run: |
+          SERVER_PRIVATE=$(cat wg-config/server_private.key)
+          CLIENT_PUBLIC=$(cat wg-config/client_public.key)
+          IFACE="${{ steps.net.outputs.iface }}"
+          PORT="${{ github.event.inputs.listen_port }}"
+          cat > wg-config/wg0.conf <<EOF
+          [Interface]
+          Address = 10.66.66.1/24
+          ListenPort = ${PORT}
+          PrivateKey = ${SERVER_PRIVATE}
+          PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${IFACE} -j MASQUERADE
+          PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${IFACE} -j MASQUERADE
+
+          [Peer]
+          PublicKey = ${CLIENT_PUBLIC}
+          AllowedIPs = 10.66.66.2/32
+          EOF
+
+      - name: Démarrer WireGuard
+        run: |
+          sudo cp wg-config/wg0.conf /etc/wireguard/wg0.conf
+          sudo chmod 600 /etc/wireguard/wg0.conf
+          sudo wg-quick up wg0
+          sudo wg show
+
+      - name: Générer la configuration client
+        run: |
+          CLIENT_PRIVATE=$(cat wg-config/client_private.key)
+          SERVER_PUBLIC=$(cat wg-config/server_public.key)
+          HOST="${{ github.event.inputs.endpoint_host }}"
+          PORT="${{ github.event.inputs.listen_port }}"
+          cat > wg-config/client.conf <<EOF
+          [Interface]
+          PrivateKey = ${CLIENT_PRIVATE}
+          Address = 10.66.66.2/32
+          DNS = 1.1.1.1
+
+          [Peer]
+          PublicKey = ${SERVER_PUBLIC}
+          Endpoint = ${HOST}:${PORT}
+          AllowedIPs = 0.0.0.0/0
+          PersistentKeepalive = 25
+          EOF
+          echo "---- client.conf ----"
+          cat wg-config/client.conf
+
+      - name: Afficher le QR code dans les logs
+        run: qrencode -t ansiutf8 < wg-config/client.conf
+
+      - name: Informations réseau du runner
+        run: |
+          echo "IP publique du runner : $(curl -s https://ifconfig.me || true)"
+          echo "Endpoint configuré dans le client : ${{ github.event.inputs.endpoint_host }}:${{ github.event.inputs.listen_port }}"
+          echo "⚠️  Le runner GitHub est derrière un NAT : cet endpoint n'est pas joignable directement depuis l'extérieur."
+          echo "   Utilisez Tailscale ou un NAT traversal pour un accès réel."
+
+      - name: Téléverser la configuration en artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wireguard-client-config
+          path: wg-config/client.conf
+          retention-days: 1
+
+      - name: Maintenir le tunnel actif
+        run: |
+          MINUTES="${{ github.event.inputs.job_duration_minutes }}"
+          SECONDS_TO_SLEEP=$((MINUTES * 60))
+          echo "Le tunnel reste actif pendant ${MINUTES} minutes..."
+          sleep "${SECONDS_TO_SLEEP}"
