@@ -33,11 +33,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Installer WireGuard, qrencode, nmap (nping), STUN et outils réseau
+      - name: Installer WireGuard, qrencode, nmap (nping) et outils réseau
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            wireguard wireguard-tools qrencode nmap coturn-utils iptables iproute2 curl python3
+            wireguard wireguard-tools qrencode nmap iptables iproute2 curl python3
 
       - name: Charger le module noyau WireGuard si disponible
         run: |
@@ -62,24 +62,68 @@ jobs:
         run: |
           IFACE=$(ip -4 route ls default | awk '/default/ {print $5; exit}')
 
-          STUN_IP=""
-          STUN_PORT=""
-          for server in "stun.l.google.com:19302" "stun1.l.google.com:19302" "stun.cloudflare.com:3478"; do
-            HOST_S="${server%:*}"
-            PORT_S="${server#*:}"
-            OUT=$(stunclient --mode basic --localport "$WG_PORT" "$HOST_S" "$PORT_S" 2>/dev/null || true)
-            MAPPED_IP=$(echo "$OUT" | awk '/Mapped address/ {print $3}' | cut -d: -f1 | head -n1)
-            MAPPED_PORT=$(echo "$OUT" | awk '/Mapped address/ {print $3}' | cut -d: -f2 | head -n1)
-            if [ -n "$MAPPED_IP" ]; then
-              STUN_IP="$MAPPED_IP"
-              STUN_PORT="$MAPPED_PORT"
-              echo "Réponse STUN (${server}) -> IP: ${STUN_IP}, Port mappé: ${STUN_PORT:-inconnu}"
-              break
-            fi
-          done
+          STUN_RESULT=$(python3 - <<'PY' || true
+import os, socket, struct
 
-          if [ -z "$STUN_IP" ]; then
+servers = [
+    ("stun.l.google.com", 19302),
+    ("stun1.l.google.com", 19302),
+    ("stun.cloudflare.com", 3478),
+]
+local_port = int(os.environ.get("WG_PORT", "51820"))
+tid = os.urandom(12)
+# STUN Binding Request: type 0x0001, length 0, magic cookie 0x2112A442 + 12-byte transaction ID
+req = struct.pack("!HHI12s", 0x0001, 0, 0x2112A442, tid)
+
+for host, port in servers:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2.0)
+    try:
+        sock.bind(("0.0.0.0", local_port))
+        sock.sendto(req, (host, port))
+        data, _ = sock.recvfrom(1024)
+        if len(data) < 20:
+            continue
+        msg_type, msg_len, cookie, resp_tid = struct.unpack("!HHI12s", data[:20])
+        if msg_type != 0x0101 or cookie != 0x2112A442 or resp_tid != tid:
+            continue
+        idx = 20
+        while idx + 4 <= 20 + msg_len and idx + 4 <= len(data):
+            attr_type, attr_len = struct.unpack("!HH", data[idx:idx+4])
+            val = data[idx+4:idx+4+attr_len]
+            if attr_type == 0x0020 and attr_len >= 8:  # XOR-MAPPED-ADDRESS
+                fam = val[1]
+                if fam == 0x01:
+                    xport = struct.unpack("!H", val[2:4])[0] ^ 0x2112
+                    xip = struct.unpack("!I", val[4:8])[0] ^ 0x2112A442
+                    ip_str = socket.inet_ntoa(struct.pack("!I", xip))
+                    print(f"{ip_str}:{xport}")
+                    break
+            elif attr_type == 0x0001 and attr_len >= 8:  # MAPPED-ADDRESS
+                fam = val[1]
+                if fam == 0x01:
+                    mport = struct.unpack("!H", val[2:4])[0]
+                    ip_str = socket.inet_ntoa(val[4:8])
+                    print(f"{ip_str}:{mport}")
+                    break
+            idx += 4 + attr_len + ((4 - (attr_len % 4)) % 4)
+        else:
+            continue
+        break
+    except Exception:
+        pass
+    finally:
+        sock.close()
+PY
+)
+
+          if [ -n "$STUN_RESULT" ]; then
+            STUN_IP="${STUN_RESULT%:*}"
+            STUN_PORT="${STUN_RESULT#*:}"
+            echo "Réponse STUN -> IP: ${STUN_IP}, Port mappé: ${STUN_PORT}"
+          else
             STUN_IP=$(curl -4 -fsSL https://ifconfig.me || curl -4 -fsSL https://api.ipify.org || echo "127.0.0.1")
+            STUN_PORT=""
             echo "STUN indisponible, repli IP publique : ${STUN_IP}"
           fi
 
