@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       endpoint_host:
-        description: "IP/domaine d'endpoint (laisser vide pour auto via STUN/IP publique)"
+        description: "IP ou domaine d'endpoint (laisser vide pour IP publique auto)"
         required: false
         default: ""
       listen_port:
@@ -12,7 +12,7 @@ on:
         required: false
         default: "51820"
       client_ip:
-        description: "IP publique observée du client (pour nping)"
+        description: "IP publique du client (pour nping)"
         required: false
         default: ""
       client_port:
@@ -20,7 +20,7 @@ on:
         required: false
         default: ""
       job_duration_minutes:
-        description: "Durée de maintien en minutes (max 350)"
+        description: "Durée en minutes (max 350)"
         required: false
         default: "300"
 
@@ -33,15 +33,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Installer WireGuard, qrencode, nmap (nping) et outils réseau
+      - name: Installer les paquets
         run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard wireguard-tools qrencode nmap iptables iproute2 curl python3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-tools qrencode nmap iptables iproute2 curl
 
-      - name: Charger le module noyau WireGuard si disponible
-        run: sudo modprobe wireguard || true
-
-      - name: Activer le transfert IP (IPv4 & IPv6)
+      - name: Activer le transfert IP
         run: |
           sudo sysctl -w net.ipv4.ip_forward=1
           sudo sysctl -w net.ipv6.conf.all.forwarding=1
@@ -53,70 +50,29 @@ jobs:
           wg genkey | tee wg-config/server_private.key | wg pubkey > wg-config/server_public.key
           wg genkey | tee wg-config/client_private.key | wg pubkey > wg-config/client_public.key
 
-      - name: Détecter l'interface réseau et l'IP publique via STUN
+      - name: Détecter interface et IP publique
         id: net
-        env:
-          INPUT_PORT: ${{ github.event.inputs.listen_port }}
         run: |
-          PORT="${INPUT_PORT:-51820}"
           IFACE=$(ip -4 route ls default | awk '/default/ {print $5; exit}')
-          STUN_IP=$(curl -4 -fsSL https://ifconfig.me || curl -4 -fsSL https://api.ipify.org || echo "127.0.0.1")
-          STUN_RESULT=$(python3 -c '
-import os, socket, struct
-servers = [("stun.l.google.com", 19302), ("stun1.l.google.com", 19302), ("stun.cloudflare.com", 3478)]
-local_port = int(os.environ.get("WG_LOCAL_PORT", "51820"))
-tid = os.urandom(12)
-req = struct.pack("!HHI12s", 0x0001, 0, 0x2112A442, tid)
-for host, port in servers:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(2.0)
-    try:
-        s.bind(("0.0.0.0", local_port))
-        s.sendto(req, (host, port))
-        data, _ = s.recvfrom(1024)
-        if len(data) >= 20:
-            mtype, mlen, cookie, rtid = struct.unpack("!HHI12s", data[:20])
-            if mtype == 0x0101 and cookie == 0x2112A442 and rtid == tid:
-                idx = 20
-                while idx + 4 <= 20 + mlen and idx + 4 <= len(data):
-                    atype, alen = struct.unpack("!HH", data[idx:idx+4])
-                    val = data[idx+4:idx+4+alen]
-                    if atype == 0x0020 and alen >= 8 and val[1] == 0x01:
-                        xport = struct.unpack("!H", val[2:4])[0] ^ 0x2112
-                        xip = struct.unpack("!I", val[4:8])[0] ^ 0x2112A442
-                        print(socket.inet_ntoa(struct.pack("!I", xip)) + ":" + str(xport))
-                        raise SystemExit(0)
-                    idx += 4 + alen + ((4 - (alen % 4)) % 4)
-    except SystemExit:
-        raise
-    except Exception:
-        pass
-    finally:
-        s.close()
-' 2>/dev/null || true)
-          if [ -n "$STUN_RESULT" ]; then
-            STUN_IP="${STUN_RESULT%:*}"
-            echo "STUN détecté : ${STUN_RESULT}"
-          else
-            echo "Repli IP publique : ${STUN_IP}"
-          fi
+          PUBLIC_IP=$(curl -4 -fsSL https://ifconfig.me || curl -4 -fsSL https://api.ipify.org || echo "127.0.0.1")
           echo "iface=${IFACE}" >> "$GITHUB_OUTPUT"
-          echo "public_ip=${STUN_IP}" >> "$GITHUB_OUTPUT"
+          echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
 
-      - name: Créer la configuration serveur WireGuard
+      - name: Configurer et démarrer WireGuard
         env:
-          IFACE: ${{ steps.net.outputs.iface }}
-          INPUT_PORT: ${{ github.event.inputs.listen_port }}
+          IFACE: "${{ steps.net.outputs.iface }}"
+          LISTEN_PORT: "${{ github.event.inputs.listen_port }}"
         run: |
+          PORT="${LISTEN_PORT:-51820}"
           SERVER_PRIVATE=$(cat wg-config/server_private.key)
           CLIENT_PUBLIC=$(cat wg-config/client_public.key)
-          PORT="${INPUT_PORT:-51820}"
+
           cat > wg-config/wg0.conf <<EOF
           [Interface]
           Address = 10.66.66.1/24
           ListenPort = ${PORT}
           PrivateKey = ${SERVER_PRIVATE}
-          PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${IFACE} -j MASQUERADE
+          PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${IFACE} -j MASQUERADE
           PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${IFACE} -j MASQUERADE
 
           [Peer]
@@ -124,22 +80,21 @@ for host, port in servers:
           AllowedIPs = 10.66.66.2/32
           EOF
 
-      - name: Démarrer WireGuard
-        run: |
           sudo install -m 600 wg-config/wg0.conf /etc/wireguard/wg0.conf
           sudo wg-quick up wg0
           sudo wg show
 
-      - name: Générer la configuration client
+      - name: Générer client.conf et QR code
         env:
-          INPUT_HOST: ${{ github.event.inputs.endpoint_host }}
-          PUBLIC_IP: ${{ steps.net.outputs.public_ip }}
-          INPUT_PORT: ${{ github.event.inputs.listen_port }}
+          ENDPOINT_HOST: "${{ github.event.inputs.endpoint_host }}"
+          PUBLIC_IP: "${{ steps.net.outputs.public_ip }}"
+          LISTEN_PORT: "${{ github.event.inputs.listen_port }}"
         run: |
+          HOST="${ENDPOINT_HOST:-$PUBLIC_IP}"
+          PORT="${LISTEN_PORT:-51820}"
           CLIENT_PRIVATE=$(cat wg-config/client_private.key)
           SERVER_PUBLIC=$(cat wg-config/server_public.key)
-          HOST="${INPUT_HOST:-$PUBLIC_IP}"
-          PORT="${INPUT_PORT:-51820}"
+
           cat > wg-config/client.conf <<EOF
           [Interface]
           PrivateKey = ${CLIENT_PRIVATE}
@@ -152,34 +107,35 @@ for host, port in servers:
           AllowedIPs = 0.0.0.0/0
           PersistentKeepalive = 25
           EOF
+
           cat wg-config/client.conf
+          qrencode -t ansiutf8 < wg-config/client.conf
 
-      - name: Afficher le QR code dans les logs
-        run: qrencode -t ansiutf8 < wg-config/client.conf
-
-      - name: Percement NAT UDP vers le client (nping)
+      - name: Percement NAT UDP (nping)
         env:
-          CLIENT_IP: ${{ github.event.inputs.client_ip }}
-          CLIENT_PORT: ${{ github.event.inputs.client_port }}
-          INPUT_PORT: ${{ github.event.inputs.listen_port }}
-          INPUT_MIN: ${{ github.event.inputs.job_duration_minutes }}
+          CLIENT_IP: "${{ github.event.inputs.client_ip }}"
+          CLIENT_PORT: "${{ github.event.inputs.client_port }}"
+          LISTEN_PORT: "${{ github.event.inputs.listen_port }}"
+          DURATION_MIN: "${{ github.event.inputs.job_duration_minutes }}"
         run: |
           if [ -z "$CLIENT_IP" ] || [ -z "$CLIENT_PORT" ]; then
-            echo "client_ip ou client_port non renseigné : nping ignoré."
+            echo "client_ip ou client_port vide : nping ignoré."
             exit 0
           fi
-          WG_PORT="${INPUT_PORT:-51820}"
-          MINUTES="${INPUT_MIN:-300}"
+
+          WG_PORT="${LISTEN_PORT:-51820}"
+          MINUTES="${DURATION_MIN:-300}"
           if [ "$MINUTES" -gt 350 ]; then
             MINUTES=350
           fi
+
           END_TS=$(( $(date +%s) + MINUTES * 60 ))
           while [ "$(date +%s)" -lt "$END_TS" ]; do
             sudo nping --udp -g "$WG_PORT" -p "$CLIENT_PORT" -c 1 --delay 0 "$CLIENT_IP" >/dev/null 2>&1 || true
             sleep 25
           done &
 
-      - name: Téléverser la configuration en artefact
+      - name: Téléverser l'artefact
         uses: actions/upload-artifact@v4
         with:
           name: wireguard-client-config
@@ -188,9 +144,9 @@ for host, port in servers:
 
       - name: Maintenir le tunnel actif
         env:
-          INPUT_MIN: ${{ github.event.inputs.job_duration_minutes }}
+          DURATION_MIN: "${{ github.event.inputs.job_duration_minutes }}"
         run: |
-          MINUTES="${INPUT_MIN:-300}"
+          MINUTES="${DURATION_MIN:-300}"
           if [ "$MINUTES" -gt 350 ]; then
             MINUTES=350
           fi
