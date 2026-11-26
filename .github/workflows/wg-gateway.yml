@@ -19,7 +19,7 @@ jobs:
       - name: Installer dépendances
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq wireguard-tools curl wget tar
+          sudo apt-get install -y -qq wireguard-tools curl wget tar iproute2
 
       - name: Installer wstunnel et bore
         run: |
@@ -27,13 +27,17 @@ jobs:
           WSTUNNEL_VER="v10.1.5"
           wget -q "https://github.com/erebe/wstunnel/releases/download/${WSTUNNEL_VER}/wstunnel_${WSTUNNEL_VER#v}_linux_amd64.tar.gz"
           tar xzf wstunnel_*_linux_amd64.tar.gz
+          chmod +x wstunnel
           sudo mv wstunnel /usr/local/bin/
+          sudo chmod +x /usr/local/bin/wstunnel
           rm -f wstunnel_*_linux_amd64.tar.gz
 
           BORE_VER="v0.5.3"
           wget -q "https://github.com/ekzhang/bore/releases/download/${BORE_VER}/bore-${BORE_VER}-x86_64-unknown-linux-musl.tar.gz"
           tar xzf bore-*.tar.gz
+          chmod +x bore
           sudo mv bore /usr/local/bin/
+          sudo chmod +x /usr/local/bin/bore
           rm -f bore-*.tar.gz
 
       - name: Activer le forwarding IP
@@ -74,6 +78,10 @@ jobs:
           nohup wstunnel server ws://0.0.0.0:8080 --restrict-to 127.0.0.1:51820 > /tmp/wstunnel.log 2>&1 &
           sleep 2
           cat /tmp/wstunnel.log
+          if ! ss -tlnp | grep -q ':8080'; then
+            echo "ERREUR : wstunnel n'écoute pas sur le port 8080" >&2
+            exit 1
+          fi
 
       - name: Exposer via bore.pub
         id: bore
@@ -82,6 +90,10 @@ jobs:
           sleep 8
           cat /tmp/bore.log
           PORT=$(grep -oP 'bore\.pub:\K[0-9]+' /tmp/bore.log | head -1)
+          if [ -z "$PORT" ]; then
+            echo "ERREUR : impossible de détecter le port public bore.pub" >&2
+            exit 1
+          fi
           echo "public_port=${PORT}" >> $GITHUB_OUTPUT
 
       - name: Afficher la configuration client
@@ -92,7 +104,6 @@ jobs:
           echo "Endpoint public : bore.pub:${{ steps.bore.outputs.public_port }}"
           echo ""
           echo "--- Téléphone (Termux) : lancer wstunnel ---"
-          echo "pkg install wstunnel -y"
           echo "wstunnel client -L \"udp://51821:127.0.0.1:51820?timeout_sec=0\" ws://bore.pub:${{ steps.bore.outputs.public_port }}"
           echo ""
           echo "--- Fichier WireGuard (importer dans l'app) ---"
