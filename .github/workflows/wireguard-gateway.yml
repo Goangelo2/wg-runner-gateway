@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       endpoint_host:
-        description: "IP publique ou domaine du runner (laisser vide pour 127.0.0.1)"
+        description: "IP/domaine du relais/NAT traversal ou IP publique (laisser vide pour auto)"
         required: false
-        default: "127.0.0.1"
+        default: ""
       listen_port:
         description: "Port UDP d'écoute WireGuard"
         required: false
@@ -25,12 +25,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Installer WireGuard, qrencode et iptables
+      - name: Installer WireGuard, qrencode, iptables et outils réseau
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y wireguard-tools qrencode iptables curl
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            wireguard wireguard-tools qrencode iptables iproute2 curl
 
-      - name: Activer le transfert IP
+      - name: Charger le module noyau WireGuard si disponible
+        run: |
+          sudo modprobe wireguard || echo "Module wireguard non chargé via modprobe (vérification de l'interface au démarrage)"
+
+      - name: Activer le transfert IP (IPv4 & IPv6)
         run: |
           sudo sysctl -w net.ipv4.ip_forward=1
           sudo sysctl -w net.ipv6.conf.all.forwarding=1
@@ -42,19 +47,23 @@ jobs:
           wg genkey | tee wg-config/server_private.key | wg pubkey > wg-config/server_public.key
           wg genkey | tee wg-config/client_private.key | wg pubkey > wg-config/client_public.key
 
-      - name: Détecter l'interface réseau par défaut
+      - name: Détecter l'interface réseau et l'IP publique
         id: net
         run: |
           IFACE=$(ip -4 route ls default | awk '/default/ {print $5; exit}')
+          PUBLIC_IP=$(curl -4 -fsSL https://ifconfig.me || curl -4 -fsSL https://api.ipify.org || echo "127.0.0.1")
           echo "iface=${IFACE}" >> "$GITHUB_OUTPUT"
+          echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
           echo "Interface détectée : ${IFACE}"
+          echo "IP publique détectée : ${PUBLIC_IP}"
 
       - name: Créer la configuration serveur WireGuard
         run: |
           SERVER_PRIVATE=$(cat wg-config/server_private.key)
           CLIENT_PUBLIC=$(cat wg-config/client_public.key)
           IFACE="${{ steps.net.outputs.iface }}"
-          PORT="${{ github.event.inputs.listen_port }}"
+          PORT="${{ github.event.inputs.listen_port || '51820' }}"
+
           cat > wg-config/wg0.conf <<EOF
           [Interface]
           Address = 10.66.66.1/24
@@ -70,8 +79,7 @@ jobs:
 
       - name: Démarrer WireGuard
         run: |
-          sudo cp wg-config/wg0.conf /etc/wireguard/wg0.conf
-          sudo chmod 600 /etc/wireguard/wg0.conf
+          sudo install -m 600 wg-config/wg0.conf /etc/wireguard/wg0.conf
           sudo wg-quick up wg0
           sudo wg show
 
@@ -79,8 +87,14 @@ jobs:
         run: |
           CLIENT_PRIVATE=$(cat wg-config/client_private.key)
           SERVER_PUBLIC=$(cat wg-config/server_public.key)
-          HOST="${{ github.event.inputs.endpoint_host }}"
-          PORT="${{ github.event.inputs.listen_port }}"
+          RAW_HOST="${{ github.event.inputs.endpoint_host }}"
+          if [ -z "$RAW_HOST" ]; then
+            HOST="${{ steps.net.outputs.public_ip }}"
+          else
+            HOST="$RAW_HOST"
+          fi
+          PORT="${{ github.event.inputs.listen_port || '51820' }}"
+
           cat > wg-config/client.conf <<EOF
           [Interface]
           PrivateKey = ${CLIENT_PRIVATE}
@@ -93,18 +107,18 @@ jobs:
           AllowedIPs = 0.0.0.0/0
           PersistentKeepalive = 25
           EOF
+
           echo "---- client.conf ----"
           cat wg-config/client.conf
 
       - name: Afficher le QR code dans les logs
         run: qrencode -t ansiutf8 < wg-config/client.conf
 
-      - name: Informations réseau du runner
+      - name: Informations réseau et avertissement NAT
         run: |
-          echo "IP publique du runner : $(curl -s https://ifconfig.me || true)"
-          echo "Endpoint configuré dans le client : ${{ github.event.inputs.endpoint_host }}:${{ github.event.inputs.listen_port }}"
-          echo "⚠️  Le runner GitHub est derrière un NAT : cet endpoint n'est pas joignable directement depuis l'extérieur."
-          echo "   Utilisez Tailscale ou un NAT traversal pour un accès réel."
+          echo "IP publique du runner : ${{ steps.net.outputs.public_ip }}"
+          echo "Endpoint client généré : ${{ github.event.inputs.endpoint_host || steps.net.outputs.public_ip }}:${{ github.event.inputs.listen_port || '51820' }}"
+          echo "⚠️  Les runners GitHub hébergés sont derrière un NAT : utilisez un relais / NAT traversal ou Tailscale pour un accès réel."
 
       - name: Téléverser la configuration en artefact
         uses: actions/upload-artifact@v4
@@ -115,7 +129,10 @@ jobs:
 
       - name: Maintenir le tunnel actif
         run: |
-          MINUTES="${{ github.event.inputs.job_duration_minutes }}"
+          MINUTES="${{ github.event.inputs.job_duration_minutes || '300' }}"
+          if [ "$MINUTES" -gt 350 ]; then
+            MINUTES=350
+          fi
           SECONDS_TO_SLEEP=$((MINUTES * 60))
           echo "Le tunnel reste actif pendant ${MINUTES} minutes..."
           sleep "${SECONDS_TO_SLEEP}"
