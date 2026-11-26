@@ -4,13 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       endpoint_host:
-        description: "IP/domaine du relais/NAT traversal ou IP publique (laisser vide pour auto)"
+        description: "IP/domaine d'endpoint à forcer (laisser vide pour auto via STUN/IP publique)"
         required: false
         default: ""
       listen_port:
         description: "Port UDP d'écoute WireGuard"
         required: false
         default: "51820"
+      client_ip:
+        description: "IP publique observée du client (pour le percement NAT UDP)"
+        required: false
+        default: ""
+      client_port:
+        description: "Port UDP source du client (pour le percement NAT UDP)"
+        required: false
+        default: ""
       job_duration_minutes:
         description: "Durée de maintien du tunnel en minutes (max 350)"
         required: false
@@ -25,11 +33,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Installer WireGuard, qrencode, iptables et outils réseau
+      - name: Installer WireGuard, qrencode, nmap (nping), STUN et outils réseau
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            wireguard wireguard-tools qrencode iptables iproute2 curl
+            wireguard wireguard-tools qrencode nmap coturn-utils iptables iproute2 curl python3
 
       - name: Charger le module noyau WireGuard si disponible
         run: |
@@ -47,15 +55,38 @@ jobs:
           wg genkey | tee wg-config/server_private.key | wg pubkey > wg-config/server_public.key
           wg genkey | tee wg-config/client_private.key | wg pubkey > wg-config/client_public.key
 
-      - name: Détecter l'interface réseau et l'IP publique
+      - name: Détecter l'interface réseau et l'IP publique via STUN
         id: net
+        env:
+          WG_PORT: ${{ github.event.inputs.listen_port || '51820' }}
         run: |
           IFACE=$(ip -4 route ls default | awk '/default/ {print $5; exit}')
-          PUBLIC_IP=$(curl -4 -fsSL https://ifconfig.me || curl -4 -fsSL https://api.ipify.org || echo "127.0.0.1")
+
+          STUN_IP=""
+          STUN_PORT=""
+          for server in "stun.l.google.com:19302" "stun1.l.google.com:19302" "stun.cloudflare.com:3478"; do
+            HOST_S="${server%:*}"
+            PORT_S="${server#*:}"
+            OUT=$(stunclient --mode basic --localport "$WG_PORT" "$HOST_S" "$PORT_S" 2>/dev/null || true)
+            MAPPED_IP=$(echo "$OUT" | awk '/Mapped address/ {print $3}' | cut -d: -f1 | head -n1)
+            MAPPED_PORT=$(echo "$OUT" | awk '/Mapped address/ {print $3}' | cut -d: -f2 | head -n1)
+            if [ -n "$MAPPED_IP" ]; then
+              STUN_IP="$MAPPED_IP"
+              STUN_PORT="$MAPPED_PORT"
+              echo "Réponse STUN (${server}) -> IP: ${STUN_IP}, Port mappé: ${STUN_PORT:-inconnu}"
+              break
+            fi
+          done
+
+          if [ -z "$STUN_IP" ]; then
+            STUN_IP=$(curl -4 -fsSL https://ifconfig.me || curl -4 -fsSL https://api.ipify.org || echo "127.0.0.1")
+            echo "STUN indisponible, repli IP publique : ${STUN_IP}"
+          fi
+
           echo "iface=${IFACE}" >> "$GITHUB_OUTPUT"
-          echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
+          echo "public_ip=${STUN_IP}" >> "$GITHUB_OUTPUT"
+          echo "stun_port=${STUN_PORT}" >> "$GITHUB_OUTPUT"
           echo "Interface détectée : ${IFACE}"
-          echo "IP publique détectée : ${PUBLIC_IP}"
 
       - name: Créer la configuration serveur WireGuard
         run: |
@@ -88,10 +119,10 @@ jobs:
           CLIENT_PRIVATE=$(cat wg-config/client_private.key)
           SERVER_PUBLIC=$(cat wg-config/server_public.key)
           RAW_HOST="${{ github.event.inputs.endpoint_host }}"
-          if [ -z "$RAW_HOST" ]; then
-            HOST="${{ steps.net.outputs.public_ip }}"
-          else
+          if [ -n "$RAW_HOST" ]; then
             HOST="$RAW_HOST"
+          else
+            HOST="${{ steps.net.outputs.public_ip }}"
           fi
           PORT="${{ github.event.inputs.listen_port || '51820' }}"
 
@@ -114,11 +145,33 @@ jobs:
       - name: Afficher le QR code dans les logs
         run: qrencode -t ansiutf8 < wg-config/client.conf
 
-      - name: Informations réseau et avertissement NAT
+      - name: Percement NAT UDP vers le client (nping)
+        env:
+          CLIENT_IP: ${{ github.event.inputs.client_ip }}
+          CLIENT_PORT: ${{ github.event.inputs.client_port }}
+          WG_PORT: ${{ github.event.inputs.listen_port || '51820' }}
+          MINUTES: ${{ github.event.inputs.job_duration_minutes || '300' }}
         run: |
-          echo "IP publique du runner : ${{ steps.net.outputs.public_ip }}"
-          echo "Endpoint client généré : ${{ github.event.inputs.endpoint_host || steps.net.outputs.public_ip }}:${{ github.event.inputs.listen_port || '51820' }}"
-          echo "⚠️  Les runners GitHub hébergés sont derrière un NAT : utilisez un relais / NAT traversal ou Tailscale pour un accès réel."
+          if [ -z "$CLIENT_IP" ] || [ -z "$CLIENT_PORT" ]; then
+            echo "client_ip ou client_port non renseigné : percement NAT UDP ignoré."
+            exit 0
+          fi
+
+          if [ "$MINUTES" -gt 350 ]; then
+            MINUTES=350
+          fi
+
+          END_TS=$(( $(date +%s) + MINUTES * 60 ))
+          echo "Démarrage du percement NAT UDP depuis le port ${WG_PORT} vers ${CLIENT_IP}:${CLIENT_PORT} jusqu'à ${MINUTES} min..."
+
+          (
+            while [ "$(date +%s)" -lt "$END_TS" ]; do
+              sudo nping --udp -g "$WG_PORT" -p "$CLIENT_PORT" -c 1 --delay 0 "$CLIENT_IP" >/dev/null 2>&1 || true
+              sleep 25
+            done
+          ) &
+          NPING_PID=$!
+          echo "PID nping en arrière-plan : ${NPING_PID}"
 
       - name: Téléverser la configuration en artefact
         uses: actions/upload-artifact@v4
