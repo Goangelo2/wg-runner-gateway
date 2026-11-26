@@ -21,7 +21,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq wireguard-tools curl wget tar iproute2
 
-      - name: Installer wstunnel et bore
+      - name: Installer wstunnel et cloudflared
         run: |
           set -e
           WSTUNNEL_VER="v10.1.5"
@@ -32,13 +32,10 @@ jobs:
           sudo chmod +x /usr/local/bin/wstunnel
           rm -f wstunnel_*_linux_amd64.tar.gz
 
-          BORE_VER="v0.5.3"
-          wget -q "https://github.com/ekzhang/bore/releases/download/${BORE_VER}/bore-${BORE_VER}-x86_64-unknown-linux-musl.tar.gz"
-          tar xzf bore-*.tar.gz
-          chmod +x bore
-          sudo mv bore /usr/local/bin/
-          sudo chmod +x /usr/local/bin/bore
-          rm -f bore-*.tar.gz
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared-linux-amd64
+          sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
 
       - name: Activer le forwarding IP
         run: sudo sysctl -w net.ipv4.ip_forward=1
@@ -82,22 +79,24 @@ jobs:
             exit 1
           fi
 
-      - name: Exposer via bore.pub
-        id: bore
+      - name: Exposer via Cloudflare Tunnel
+        id: cf
         run: |
-          nohup bash -c 'bore local 8080 --to bore.pub' > /tmp/bore.log 2>&1 &
-          sleep 8
-          PORT=$(grep -oP 'bore\.pub:\K[0-9]+' /tmp/bore.log | head -1)
-          if [ -z "$PORT" ]; then
-            echo "ERREUR : impossible de détecter le port public bore.pub" >&2
+          nohup bash -c 'cloudflared tunnel --url http://localhost:8080 --no-autoupdate' > /tmp/cloudflared.log 2>&1 &
+          sleep 10
+          URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1)
+          if [ -z "$URL" ]; then
+            echo "ERREUR : impossible de détecter l'URL Cloudflare" >&2
+            cat /tmp/cloudflared.log
             exit 1
           fi
-          echo "public_port=${PORT}" >> $GITHUB_OUTPUT
+          echo "public_url=${URL}" >> $GITHUB_OUTPUT
 
-      - name: Créer le fichier de configuration et le script Termux
+      - name: Créer le fichier de configuration
         run: |
           mkdir -p output
-          # Création du fichier WireGuard
+          WSS_URL=$(echo "${{ steps.cf.outputs.public_url }}" | sed 's/https/wss/')
+          
           cat > output/wg-github.conf <<EOF
           [Interface]
           PrivateKey = ${{ env.CLIENT_PRIVATE }}
@@ -111,11 +110,10 @@ jobs:
           PersistentKeepalive = 25
           EOF
 
-          # Création d'un fichier texte avec la commande Termux
           cat > output/commande-termux.txt <<EOF
           Copiez-collez cette commande dans Termux :
           
-          wstunnel client -L "udp://51821:127.0.0.1:51820?timeout_sec=0" ws://bore.pub:${{ steps.bore.outputs.public_port }}
+          ./wstunnel client -L "udp://51821:127.0.0.1:51820?timeout_sec=0" $WSS_URL
           EOF
 
       - name: Uploader l'artefact (ZIP)
@@ -123,14 +121,6 @@ jobs:
         with:
           name: Configuration-VPN
           path: output/
-
-      - name: Afficher la configuration client
-        run: |
-          echo "════════════════════════════════════════════════════"
-          echo "  CONFIGURATION PRÊTE (Téléchargeable dans les Artefacts)"
-          echo "════════════════════════════════════════════════════"
-          echo "Endpoint public : bore.pub:${{ steps.bore.outputs.public_port }}"
-          echo "Veuillez télécharger le fichier ZIP à la fin du run."
 
       - name: Maintenir le job actif
         run: |
