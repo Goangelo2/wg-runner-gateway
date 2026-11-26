@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       endpoint_host:
-        description: "IP/domaine d'endpoint à forcer (laisser vide pour auto via STUN/IP publique)"
+        description: "IP/domaine d'endpoint (laisser vide pour auto via STUN/IP publique)"
         required: false
         default: ""
       listen_port:
@@ -12,15 +12,15 @@ on:
         required: false
         default: "51820"
       client_ip:
-        description: "IP publique observée du client (pour le percement NAT UDP)"
+        description: "IP publique observée du client (pour nping)"
         required: false
         default: ""
       client_port:
-        description: "Port UDP source du client (pour le percement NAT UDP)"
+        description: "Port UDP source du client (pour nping)"
         required: false
         default: ""
       job_duration_minutes:
-        description: "Durée de maintien du tunnel en minutes (max 350)"
+        description: "Durée de maintien en minutes (max 350)"
         required: false
         default: "300"
 
@@ -36,12 +36,10 @@ jobs:
       - name: Installer WireGuard, qrencode, nmap (nping) et outils réseau
         run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            wireguard wireguard-tools qrencode nmap iptables iproute2 curl python3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard wireguard-tools qrencode nmap iptables iproute2 curl python3
 
       - name: Charger le module noyau WireGuard si disponible
-        run: |
-          sudo modprobe wireguard || echo "Module wireguard non chargé via modprobe"
+        run: sudo modprobe wireguard || true
 
       - name: Activer le transfert IP (IPv4 & IPv6)
         run: |
@@ -58,89 +56,61 @@ jobs:
       - name: Détecter l'interface réseau et l'IP publique via STUN
         id: net
         env:
-          WG_PORT: ${{ github.event.inputs.listen_port }}
+          INPUT_PORT: ${{ github.event.inputs.listen_port }}
         run: |
-          WG_PORT="${WG_PORT:-51820}"
+          PORT="${INPUT_PORT:-51820}"
           IFACE=$(ip -4 route ls default | awk '/default/ {print $5; exit}')
-
-          STUN_RESULT=$(WG_PORT="$WG_PORT" python3 - <<'PY' || true
+          STUN_IP=$(curl -4 -fsSL https://ifconfig.me || curl -4 -fsSL https://api.ipify.org || echo "127.0.0.1")
+          STUN_RESULT=$(python3 -c '
 import os, socket, struct
-
-servers = [
-    ("stun.l.google.com", 19302),
-    ("stun1.l.google.com", 19302),
-    ("stun.cloudflare.com", 3478),
-]
-local_port = int(os.environ.get("WG_PORT", "51820"))
+servers = [("stun.l.google.com", 19302), ("stun1.l.google.com", 19302), ("stun.cloudflare.com", 3478)]
+local_port = int(os.environ.get("WG_LOCAL_PORT", "51820"))
 tid = os.urandom(12)
 req = struct.pack("!HHI12s", 0x0001, 0, 0x2112A442, tid)
-
 for host, port in servers:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(2.0)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(2.0)
     try:
-        sock.bind(("0.0.0.0", local_port))
-        sock.sendto(req, (host, port))
-        data, _ = sock.recvfrom(1024)
-        if len(data) < 20:
-            continue
-        msg_type, msg_len, cookie, resp_tid = struct.unpack("!HHI12s", data[:20])
-        if msg_type != 0x0101 or cookie != 0x2112A442 or resp_tid != tid:
-            continue
-        idx = 20
-        while idx + 4 <= 20 + msg_len and idx + 4 <= len(data):
-            attr_type, attr_len = struct.unpack("!HH", data[idx:idx+4])
-            val = data[idx+4:idx+4+attr_len]
-            if attr_type == 0x0020 and attr_len >= 8:
-                fam = val[1]
-                if fam == 0x01:
-                    xport = struct.unpack("!H", val[2:4])[0] ^ 0x2112
-                    xip = struct.unpack("!I", val[4:8])[0] ^ 0x2112A442
-                    ip_str = socket.inet_ntoa(struct.pack("!I", xip))
-                    print(f"{ip_str}:{xport}")
-                    break
-            elif attr_type == 0x0001 and attr_len >= 8:
-                fam = val[1]
-                if fam == 0x01:
-                    mport = struct.unpack("!H", val[2:4])[0]
-                    ip_str = socket.inet_ntoa(val[4:8])
-                    print(f"{ip_str}:{mport}")
-                    break
-            idx += 4 + attr_len + ((4 - (attr_len % 4)) % 4)
-        else:
-            continue
-        break
+        s.bind(("0.0.0.0", local_port))
+        s.sendto(req, (host, port))
+        data, _ = s.recvfrom(1024)
+        if len(data) >= 20:
+            mtype, mlen, cookie, rtid = struct.unpack("!HHI12s", data[:20])
+            if mtype == 0x0101 and cookie == 0x2112A442 and rtid == tid:
+                idx = 20
+                while idx + 4 <= 20 + mlen and idx + 4 <= len(data):
+                    atype, alen = struct.unpack("!HH", data[idx:idx+4])
+                    val = data[idx+4:idx+4+alen]
+                    if atype == 0x0020 and alen >= 8 and val[1] == 0x01:
+                        xport = struct.unpack("!H", val[2:4])[0] ^ 0x2112
+                        xip = struct.unpack("!I", val[4:8])[0] ^ 0x2112A442
+                        print(socket.inet_ntoa(struct.pack("!I", xip)) + ":" + str(xport))
+                        raise SystemExit(0)
+                    idx += 4 + alen + ((4 - (alen % 4)) % 4)
+    except SystemExit:
+        raise
     except Exception:
         pass
     finally:
-        sock.close()
-PY
-)
-
+        s.close()
+' 2>/dev/null || true)
           if [ -n "$STUN_RESULT" ]; then
             STUN_IP="${STUN_RESULT%:*}"
-            STUN_PORT="${STUN_RESULT#*:}"
-            echo "Réponse STUN -> IP: ${STUN_IP}, Port mappé: ${STUN_PORT}"
+            echo "STUN détecté : ${STUN_RESULT}"
           else
-            STUN_IP=$(curl -4 -fsSL https://ifconfig.me || curl -4 -fsSL https://api.ipify.org || echo "127.0.0.1")
-            STUN_PORT=""
-            echo "STUN indisponible, repli IP publique : ${STUN_IP}"
+            echo "Repli IP publique : ${STUN_IP}"
           fi
-
           echo "iface=${IFACE}" >> "$GITHUB_OUTPUT"
           echo "public_ip=${STUN_IP}" >> "$GITHUB_OUTPUT"
-          echo "stun_port=${STUN_PORT}" >> "$GITHUB_OUTPUT"
-          echo "Interface détectée : ${IFACE}"
 
       - name: Créer la configuration serveur WireGuard
         env:
           IFACE: ${{ steps.net.outputs.iface }}
-          LISTEN_PORT: ${{ github.event.inputs.listen_port }}
+          INPUT_PORT: ${{ github.event.inputs.listen_port }}
         run: |
           SERVER_PRIVATE=$(cat wg-config/server_private.key)
           CLIENT_PUBLIC=$(cat wg-config/client_public.key)
-          PORT="${LISTEN_PORT:-51820}"
-
+          PORT="${INPUT_PORT:-51820}"
           cat > wg-config/wg0.conf <<EOF
           [Interface]
           Address = 10.66.66.1/24
@@ -162,15 +132,14 @@ PY
 
       - name: Générer la configuration client
         env:
-          ENDPOINT_HOST: ${{ github.event.inputs.endpoint_host }}
+          INPUT_HOST: ${{ github.event.inputs.endpoint_host }}
           PUBLIC_IP: ${{ steps.net.outputs.public_ip }}
-          LISTEN_PORT: ${{ github.event.inputs.listen_port }}
+          INPUT_PORT: ${{ github.event.inputs.listen_port }}
         run: |
           CLIENT_PRIVATE=$(cat wg-config/client_private.key)
           SERVER_PUBLIC=$(cat wg-config/server_public.key)
-          HOST="${ENDPOINT_HOST:-$PUBLIC_IP}"
-          PORT="${LISTEN_PORT:-51820}"
-
+          HOST="${INPUT_HOST:-$PUBLIC_IP}"
+          PORT="${INPUT_PORT:-51820}"
           cat > wg-config/client.conf <<EOF
           [Interface]
           PrivateKey = ${CLIENT_PRIVATE}
@@ -183,8 +152,6 @@ PY
           AllowedIPs = 0.0.0.0/0
           PersistentKeepalive = 25
           EOF
-
-          echo "---- client.conf ----"
           cat wg-config/client.conf
 
       - name: Afficher le QR code dans les logs
@@ -194,31 +161,23 @@ PY
         env:
           CLIENT_IP: ${{ github.event.inputs.client_ip }}
           CLIENT_PORT: ${{ github.event.inputs.client_port }}
-          LISTEN_PORT: ${{ github.event.inputs.listen_port }}
-          DURATION_MIN: ${{ github.event.inputs.job_duration_minutes }}
+          INPUT_PORT: ${{ github.event.inputs.listen_port }}
+          INPUT_MIN: ${{ github.event.inputs.job_duration_minutes }}
         run: |
           if [ -z "$CLIENT_IP" ] || [ -z "$CLIENT_PORT" ]; then
-            echo "client_ip ou client_port non renseigné : percement NAT UDP ignoré."
+            echo "client_ip ou client_port non renseigné : nping ignoré."
             exit 0
           fi
-
-          WG_PORT="${LISTEN_PORT:-51820}"
-          MINUTES="${DURATION_MIN:-300}"
+          WG_PORT="${INPUT_PORT:-51820}"
+          MINUTES="${INPUT_MIN:-300}"
           if [ "$MINUTES" -gt 350 ]; then
             MINUTES=350
           fi
-
           END_TS=$(( $(date +%s) + MINUTES * 60 ))
-          echo "Démarrage du percement NAT UDP depuis le port ${WG_PORT} vers ${CLIENT_IP}:${CLIENT_PORT} jusqu'à ${MINUTES} min..."
-
-          (
-            while [ "$(date +%s)" -lt "$END_TS" ]; do
-              sudo nping --udp -g "$WG_PORT" -p "$CLIENT_PORT" -c 1 --delay 0 "$CLIENT_IP" >/dev/null 2>&1 || true
-              sleep 25
-            done
-          ) &
-          NPING_PID=$!
-          echo "PID nping en arrière-plan : ${NPING_PID}"
+          while [ "$(date +%s)" -lt "$END_TS" ]; do
+            sudo nping --udp -g "$WG_PORT" -p "$CLIENT_PORT" -c 1 --delay 0 "$CLIENT_IP" >/dev/null 2>&1 || true
+            sleep 25
+          done &
 
       - name: Téléverser la configuration en artefact
         uses: actions/upload-artifact@v4
@@ -229,12 +188,10 @@ PY
 
       - name: Maintenir le tunnel actif
         env:
-          DURATION_MIN: ${{ github.event.inputs.job_duration_minutes }}
+          INPUT_MIN: ${{ github.event.inputs.job_duration_minutes }}
         run: |
-          MINUTES="${DURATION_MIN:-300}"
+          MINUTES="${INPUT_MIN:-300}"
           if [ "$MINUTES" -gt 350 ]; then
             MINUTES=350
           fi
-          SECONDS_TO_SLEEP=$((MINUTES * 60))
-          echo "Le tunnel reste actif pendant ${MINUTES} minutes..."
-          sleep "${SECONDS_TO_SLEEP}"
+          sleep $((MINUTES * 60))
